@@ -21,8 +21,8 @@ from pathlib import Path
 # 页面设置
 # -------------------------
 st.set_page_config(page_title="ED 仿真评估", page_icon="⚕️", layout="wide")
-st.title("⚕️ 急诊排班仿真评估（事件驱动 · 周内等待口径A）")
-st.caption("只需上传 res_doctor.xlsx；到达率固定读取仓库内 Excel。")
+st.title("⚕️ 急诊排班仿真评估")
+st.caption("只需上传 res_doctor.xlsx；到达率固定。")
 
 # -------------------------
 # 路径（以脚本目录为基准）
@@ -235,7 +235,7 @@ nruns = st.sidebar.number_input("仿真次数", min_value=1, max_value=5000, val
 seed0 = st.sidebar.number_input("随机种子基数", min_value=0, max_value=10_000_000, value=0, step=1)
 
 # 只需要上传 res_doctor.xlsx
-st.subheader("上传来访者排班表（res_doctor.xlsx）")
+st.subheader("上传医生排班表（res_doctor.xlsx）注意格式一致，以及不要超过18名医生")
 upload = st.file_uploader("选择 Excel 文件（必须为 .xlsx 工作簿）", type=["xlsx"], accept_multiple_files=False)
 
 # -------------------------
@@ -259,7 +259,7 @@ if upload is not None:
             res_user = sim.run_for_schedule(sched_user, borrow_user)
 
         # 展示结果
-        st.subheader("结果（来访者上传排班）")
+        st.subheader("结果")
         # st.write(res_user["note"])
         st.code(
             f"总等待时间(人·小时) [平均±标准差 over {nruns} runs]: "
@@ -272,7 +272,7 @@ if upload is not None:
 
         # 下载
         out_df = pd.DataFrame([{
-            "方案": "来访者",
+            "方案": "当前医生排班",
             "平均总等待(人·小时)": res_user["avg_total_wait"],
             "等待标准差": res_user["std_total_wait"],
             "总工作时长": res_user["total_doctor_hours"],
