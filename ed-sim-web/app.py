@@ -259,7 +259,7 @@ if upload is not None:
             res_user = sim.run_for_schedule(sched_user, borrow_user)
 
         # 展示结果
-        st.subheader("结果")
+        st.subheader("结果（备注：我们不记录168小时后患者的等待，本代码不对排班校验排班可行性）")
         # st.write(res_user["note"])
         st.code(
             f"总等待时间(人·小时) [平均±标准差 over {nruns} runs]: "
