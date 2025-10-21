@@ -260,7 +260,7 @@ if upload is not None:
 
         # 展示结果
         st.subheader("结果（来访者上传排班）")
-        st.write(res_user["note"])
+        # st.write(res_user["note"])
         st.code(
             f"总等待时间(人·小时) [平均±标准差 over {nruns} runs]: "
             f"{res_user['avg_total_wait']:.2f} ± {res_user['std_total_wait']:.2f}\n"
