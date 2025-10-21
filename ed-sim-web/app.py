@@ -358,12 +358,9 @@ if upload is not None:
         # 显示更详细的错误上下文，帮助定位是哪一个文件导致
         st.error("出错了：" + str(e))
         st.info(
-            f"调试信息：
-"
-            f"- 上传文件名：{upload.name if upload else '（未上传）'}
-"
-            f"- 固定到达率路径：{ARRIVAL_DEFAULT_PATH}
-"
+            f"调试信息："
+            f"- 上传文件名：{upload.name if upload else '（未上传）'}"
+            f"- 固定到达率路径：{ARRIVAL_DEFAULT_PATH}"
             f"- 固定优化方案路径：{OPTIMIZED_SCHEDULE_PATH}"
         )
 else:
