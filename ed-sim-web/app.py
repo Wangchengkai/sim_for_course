@@ -186,7 +186,7 @@ class Simulator:
                             finish_time = start_time + pat_service
                             doctor_busy_until[d] = finish_time
                             total_wait_time += (start_time - pat_arrival)
-                            heapq.heappush(events, (finish时间, EVENT_FINISH, "finish", d, None))
+                            heapq.heappush(events, (finish_time, EVENT_FINISH, "finish", d, None))
 
                 elif event_type == "check_shift":
                     for d in range(n_doctors):
