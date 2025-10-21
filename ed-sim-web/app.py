@@ -36,7 +36,7 @@ from pathlib import Path
 # -------------------------
 st.set_page_config(page_title="ED 仿真评估", page_icon="⚕️", layout="wide")
 st.title("⚕️ 急诊排班仿真评估（事件驱动 · 周内等待口径A）")
-st.caption("上传排班表，快速得到等待与成本指标；并与内置优化排班进行对比。")
+st.caption("上传排班表，快速得到等待与成本指标；并与内置优化排班进行对比。\n（已移除自定义到达率上传接口，固定读取仓库内的到达率与优化方案。）")
 
 # -------------------------
 # 读取/解析工具（用脚本所在目录作为基准，避免工作目录不同导致找不到文件）
@@ -265,8 +265,7 @@ mu = st.sidebar.number_input("单医生服务率 μ (人/小时)", min_value=0.1
 nruns = st.sidebar.number_input("仿真次数", min_value=1, max_value=5000, value=1000, step=100)
 seed0 = st.sidebar.number_input("随机种子基数", min_value=0, max_value=10_000_000, value=0, step=1)
 
-# 可选上传自定义到达文件；否则使用默认到达文件
-arrival_up = st.sidebar.file_uploader("可选：自定义到达文件（含‘数据’工作表）", type=["xlsx", "xls"])
+# （按用户要求）去掉自定义到达率上传接口；一律使用仓库内默认到达文件
 
 # 必传：res_doctor.xlsx
 st.subheader("上传来访者排班表（res_doctor.xlsx）")
@@ -280,8 +279,8 @@ with col_info:
 - **res_doctor.xlsx**：
   - 第 2~19 行 × 第 2~169 列为 0/1 排班矩阵（18 × 168）。
   - 第 13 行及以后用于统计“借调医生数”（任一工时>0 计 1 人）。
-- **到达文件（可选）**：工作表名为“数据”，第 6~12 行 × 第 2~25 列为到达率（7×24）。
-- **优化方案**：默认从本地 `optimized_schedule_IDs_01_matrix.xlsx` 读取相同格式矩阵。
+- **到达文件**：固定从仓库内 `2025 服务系统问题-问题数据.xlsx` 读取（工作表名“数据”，第 6~12 行 × 第 2~25 列为到达率 7×24）。
+- **优化方案**：固定从仓库内 `optimized_schedule_IDs_01_matrix.xlsx` 读取相同格式矩阵。
 """)
 
 # -------------------------
@@ -289,16 +288,14 @@ with col_info:
 # -------------------------
 if upload is not None:
     try:
-        # 到达率
-        if arrival_up is not None:
-            arrival_rates = load_arrival_rates_from_excel(path=None, sheet_name="数据")  # 占位以走 cache 策略
-            # 直接从上传读取（不缓存）
-            df_tmp = pd.read_excel(uploaded_file:=arrival_up, sheet_name="数据", header=None)
-            arrival_rates = df_tmp.iloc[5:12, 1:25].values.astype(float)
-        else:
-            arrival_rates = load_arrival_rates_from_excel(ARRIVAL_DEFAULT_PATH)
+        # 到达率（固定本地文件）
+        if not ARRIVAL_DEFAULT_PATH.exists():
+            raise FileNotFoundError(f"未找到到达率文件：{ARRIVAL_DEFAULT_PATH}")
+        arrival_rates = load_arrival_rates_from_excel(ARRIVAL_DEFAULT_PATH)
 
         # 来访者排班
+        if upload.size == 0:
+            raise ValueError("上传的排班文件为空（0 字节）。请检查导出方式并重试。")
         sched_user, borrow_user = load_schedule_from_excel(upload.getvalue(), filename=upload.name)
         # 内置优化排班
         sched_opt, borrow_opt = load_optimized_schedule(OPTIMIZED_SCHEDULE_PATH)
@@ -358,6 +355,14 @@ if upload is not None:
         st.download_button("下载结果 CSV", data=csv, file_name="simulation_results.csv", mime="text/csv")
 
     except Exception as e:
-        st.error(f"出错了：{e}")
+        # 显示更详细的错误上下文，帮助定位是哪一个文件导致
+        st.error("出错了：" + str(e))
+        st.info(
+            f"调试信息：\n"
+            f"- 上传文件名：{upload.name if upload else '（未上传）'}\n"
+            f"- 固定到达率路径：{ARRIVAL_DEFAULT_PATH}\n"
+            f"- 固定优化方案路径：{OPTIMIZED_SCHEDULE_PATH}"
+        )
 else:
     st.info("请上传 res_doctor.xlsx（支持 .xlsx/.xls）。")
+
