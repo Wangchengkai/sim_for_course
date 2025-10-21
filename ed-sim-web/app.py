@@ -71,11 +71,42 @@ def _schedule_matrix_from_df(df: pd.DataFrame) -> np.ndarray:
 
 
 @st.cache_data(show_spinner=False)
-def load_schedule_from_excel(content: bytes) -> Tuple[np.ndarray, int]:
-    """从上传内容解析排班矩阵和借调人数。返回 (schedule_matrix, borrow_count)。"""
-    xl = pd.ExcelFile(io.BytesIO(content))
-    # 默认读取第一个工作表（与用户代码一致）
-    df = pd.read_excel(xl, sheet_name=0, header=None)
+def load_schedule_from_excel(content: bytes, filename: str = "upload.xlsx") -> Tuple[np.ndarray, int]:
+    """从上传内容解析排班矩阵和借调人数。自动适配 xlsx/xls/csv/xlsb。
+    返回 (schedule_matrix, borrow_count)。"""
+    from pathlib import Path
+    suffix = Path(filename).suffix.lower()
+    bio = io.BytesIO(content)
+
+    df = None
+    try:
+        if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            xl = pd.ExcelFile(bio, engine="openpyxl")
+            if not xl.sheet_names:
+                raise ValueError("上传文件未检测到工作表（xlsx/xlsm）。请确认不是空白或受保护文件。")
+            df = pd.read_excel(xl, sheet_name=0, header=None)
+        elif suffix == ".xls":
+            xl = pd.ExcelFile(bio, engine="xlrd")
+            if not xl.sheet_names:
+                raise ValueError("上传的 .xls 文件未检测到工作表。")
+            df = pd.read_excel(xl, sheet_name=0, header=None, engine="xlrd")
+        elif suffix == ".xlsb":
+            xl = pd.ExcelFile(bio, engine="pyxlsb")
+            if not xl.sheet_names:
+                raise ValueError("上传的 .xlsb 文件未检测到工作表。")
+            df = pd.read_excel(xl, sheet_name=0, header=None, engine="pyxlsb")
+        elif suffix == ".csv":
+            bio.seek(0)
+            df = pd.read_csv(bio, header=None)
+        else:
+            bio.seek(0)
+            xl = pd.ExcelFile(bio)
+            if not xl.sheet_names:
+                raise ValueError("上传文件未检测到任何工作表。")
+            df = pd.read_excel(xl, sheet_name=0, header=None)
+    except Exception as e:
+        raise ValueError(f"无法读取排班文件：{e}")
+
     borrow = _borrow_count_like_user(df)
     sched = _schedule_matrix_from_df(df)
     return sched, borrow
@@ -268,7 +299,7 @@ if upload is not None:
             arrival_rates = load_arrival_rates_from_excel(ARRIVAL_DEFAULT_PATH)
 
         # 来访者排班
-        sched_user, borrow_user = load_schedule_from_excel(upload.getvalue())
+        sched_user, borrow_user = load_schedule_from_excel(upload.getvalue(), filename=upload.name)
         # 内置优化排班
         sched_opt, borrow_opt = load_optimized_schedule(OPTIMIZED_SCHEDULE_PATH)
 
