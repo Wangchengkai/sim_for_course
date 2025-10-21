@@ -72,44 +72,65 @@ def _schedule_matrix_from_df(df: pd.DataFrame) -> np.ndarray:
 
 @st.cache_data(show_spinner=False)
 def load_schedule_from_excel(content: bytes, filename: str = "upload.xlsx") -> Tuple[np.ndarray, int]:
-    """从上传内容解析排班矩阵和借调人数。自动适配 xlsx/xls/csv/xlsb。
-    返回 (schedule_matrix, borrow_count)。"""
-    from pathlib import Path
-    suffix = Path(filename).suffix.lower()
+    """
+    从上传内容解析排班矩阵和借调人数。
+    对“0 worksheets found / 伪 xlsx / 受保护”等情况做鲁棒处理，并给出明确报错。
+    返回 (schedule_matrix, borrow_count)。
+    """
+    import zipfile
+    from openpyxl import load_workbook
+
     bio = io.BytesIO(content)
 
-    df = None
-    try:
-        if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-            xl = pd.ExcelFile(bio, engine="openpyxl")
-            if not xl.sheet_names:
-                raise ValueError("上传文件未检测到工作表（xlsx/xlsm）。请确认不是空白或受保护文件。")
-            df = pd.read_excel(xl, sheet_name=0, header=None)
-        elif suffix == ".xls":
-            xl = pd.ExcelFile(bio, engine="xlrd")
-            if not xl.sheet_names:
-                raise ValueError("上传的 .xls 文件未检测到工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None, engine="xlrd")
-        elif suffix == ".xlsb":
-            xl = pd.ExcelFile(bio, engine="pyxlsb")
-            if not xl.sheet_names:
-                raise ValueError("上传的 .xlsb 文件未检测到工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None, engine="pyxlsb")
-        elif suffix == ".csv":
-            bio.seek(0)
-            df = pd.read_csv(bio, header=None)
-        else:
-            bio.seek(0)
-            xl = pd.ExcelFile(bio)
-            if not xl.sheet_names:
-                raise ValueError("上传文件未检测到任何工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None)
-    except Exception as e:
-        raise ValueError(f"无法读取排班文件：{e}")
+    # -------- 1) 先判断是否为真正的 .xlsx（其实是 zip）--------
+    head = bio.read(4)
+    bio.seek(0)
+    if head != b"PK\x03\x04":
+        raise ValueError(f"文件 {filename} 不是标准 .xlsx（zip）格式，"
+                         "请用 Excel 打开后 另存为“Excel 工作簿 (.xlsx)” 再上传。")
 
-    borrow = _borrow_count_like_user(df)
-    sched = _schedule_matrix_from_df(df)
-    return sched, borrow
+    # -------- 2) 用 openpyxl 读取工作表名（比 pandas 更宽容）--------
+    try:
+        wb = load_workbook(bio, data_only=True, read_only=True)
+    except Exception as e:
+        raise ValueError(f"openpyxl 无法打开文件 {filename}：{e}")
+
+    sheet_names = wb.sheetnames or []
+    if not sheet_names:
+        raise ValueError(f"文件 {filename} 未检测到任何工作表。请确认不是空白或受保护文件。")
+
+    # 读取第一个 sheet 的所有单元格为 DataFrame
+    ws = wb[sheet_names[0]]
+    values = [[cell.value for cell in row] for row in ws.iter_rows()]
+    df = pd.DataFrame(values)
+
+    # -------- 3) 结构校验与切片（与口径一致）--------
+    # 需要至少到第 19 行、第 169 列（0-based：行索引 >=18，列索引 >=168）
+    if df.shape[0] < 19 or df.shape[1] < 169:
+        raise ValueError(
+            f"文件 {filename} 的表格尺寸过小：{df.shape}；"
+            "需要至少 19 行 × 169 列，以便从第 2~19 行 × 第 2~169 列切出 18×168 的 0/1 矩阵。"
+            f"（检测到的工作表：{sheet_names}）"
+        )
+
+    try:
+        # 第 2~19 行 × 第 2~169 列（1-based） -> 0-based 切片 1:19, 1:169
+        sched = df.iloc[1:19, 1:169].to_numpy(dtype=float).astype(int)
+    except Exception as e:
+        raise ValueError(f"文件 {filename} 取排班矩阵失败：{e}（工作表：{sheet_names[0]}）")
+
+    if sched.shape != (18, 168):
+        raise ValueError(f"排班矩阵应为 (18,168)，实际为 {sched.shape}（文件：{filename}；工作表：{sheet_names[0]}）。")
+
+    # 借调统计：第 13 行及以后（0-based >=12），任意工时>0 计 1 人
+    try:
+        borrow_part = df.iloc[12:, 1:]  # 去掉第一列索引列
+        borrow_count = int((pd.to_numeric(borrow_part, errors="coerce").fillna(0).sum(axis=1) > 0).sum())
+    except Exception as e:
+        raise ValueError(f"文件 {filename} 统计借调人数失败：{e}（工作表：{sheet_names[0]}）")
+
+    return sched, borrow_count
+
 
 
 @st.cache_data(show_spinner=False)
