@@ -2,26 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 急诊仿真网页（Streamlit）
-功能：
-1) 上传 res_doctor.xlsx（外部来访者的排班表）。
-2) 读取本地 arrival 数据文件：2025 服务系统问题-问题数据.xlsx（默认放在与本脚本同目录）。
-3) 读取本地优化方案 optimized_schedule_IDs_01_matrix.xlsx（与来访者方案对比）。
-4) 运行给定的事件驱动仿真 1000 次，输出：
-   总等待时间(人·小时) [平均±标准差 over N runs]
-   总工作成本、借调成本、总成本
-5) 可选：下载结果 CSV。
-
-请将以下文件放到本脚本同目录：
-- 2025 服务系统问题-问题数据.xlsx   （到达率）
-- optimized_schedule_IDs_01_matrix.xlsx （我们给出的优化方案）
-
-运行：
-  pip install -r requirements.txt
-  streamlit run app.py
+- 上传 res_doctor.xlsx（排班）
+- 固定读取本地到达率：2025 服务系统问题-问题数据.xlsx（工作表“数据”，第6~12行×第2~25列）
+- 固定读取本地优化方案：optimized_schedule_IDs_01_matrix.xlsx
+- 运行事件驱动仿真并输出四项指标
 """
 
 import io
-import time
 import heapq
 from collections import deque
 from typing import Tuple, Optional
@@ -36,99 +23,103 @@ from pathlib import Path
 # -------------------------
 st.set_page_config(page_title="ED 仿真评估", page_icon="⚕️", layout="wide")
 st.title("⚕️ 急诊排班仿真评估（事件驱动 · 周内等待口径A）")
-st.caption("上传排班表，快速得到等待与成本指标；并与内置优化排班进行对比。（已移除自定义到达率上传接口，固定读取仓库内的到达率与优化方案。）")
+st.caption("上传排班表，快速得到等待与成本指标；并与内置优化排班进行对比。（固定读取仓库内到达率与优化方案）")
 
 # -------------------------
-# 读取/解析工具（用脚本所在目录作为基准，避免工作目录不同导致找不到文件）
+# 路径（以脚本目录为基准）
 # -------------------------
 BASE_DIR = Path(__file__).resolve().parent
 ARRIVAL_DEFAULT_PATH = BASE_DIR / "2025 服务系统问题-问题数据.xlsx"
 OPTIMIZED_SCHEDULE_PATH = BASE_DIR / "optimized_schedule_IDs_01_matrix.xlsx"
 
+# -------------------------
+# 读取/解析工具
+# -------------------------
 @st.cache_data(show_spinner=False)
-def load_arrival_rates_from_excel(path: str, sheet_name: str = "数据") -> np.ndarray:
-    """读取到达率：7天 × 24小时，返回 shape (7,24) 的 float ndarray。"""
+def load_arrival_rates_from_excel(path: Path, sheet_name: str = "数据") -> np.ndarray:
+    """读取到达率：7×24"""
     df = pd.read_excel(path, sheet_name=sheet_name, header=None)
-    # 与用户原代码一致：第 6~12 行（0-based 5:12），第 2~25 列（1:25）
-    arr = df.iloc[5:12, 1:25].values.astype(float)
+    arr = df.iloc[5:12, 1:25].to_numpy(dtype=float)
     if arr.shape != (7, 24):
-        raise ValueError(f"到达率矩阵应为 (7,24)，当前为 {arr.shape}。请检查文件/切片。")
+        raise ValueError(f"到达率矩阵应为 (7,24)，当前为 {arr.shape}。")
     return arr
 
-
-def _borrow_count_like_user(df: pd.DataFrame) -> int:
-    """按用户口径：取出第13行及之后的子表，统计借调医生数（是否有任意工时）"""
-    borrow_part = df.iloc[12:, 1:]  # 第13行起、去掉第一列索引列
+def _compute_borrow_count(df: pd.DataFrame) -> int:
+    """
+    借调人数：第13行及以后（0-based>=12），任一工时>0 计1人。
+    逐列数值化以稳健处理空/文本等。
+    """
+    if df.shape[0] <= 12:
+        return 0
+    borrow_part = df.iloc[12:, 1:]                       # 去掉第一列
+    borrow_part = borrow_part.apply(pd.to_numeric, errors="coerce").fillna(0)
     return int((borrow_part.sum(axis=1) > 0).sum())
 
-
 def _schedule_matrix_from_df(df: pd.DataFrame) -> np.ndarray:
-    """解析 18×168 的 0/1 矩阵（第2~19行、第2~169列），与用户代码对齐。"""
-    sched = df.iloc[1:19, 1:169].values.astype(int)
+    """切 18×168（第2~19行×第2~169列），并做数值化→四舍五入→int"""
+    if df.shape[0] < 19 or df.shape[1] < 169:
+        raise ValueError(f"排班表尺寸过小：{df.shape}，至少需 19×169。")
+    block = df.iloc[1:19, 1:169]
+    block_num = block.apply(pd.to_numeric, errors="coerce").fillna(0)
+    sched = block_num.round().astype(int).to_numpy()
     if sched.shape != (18, 168):
-        raise ValueError(f"排班矩阵应为 (18,168)，当前为 {sched.shape}。")
+        raise ValueError(f"排班矩阵应为 (18,168)，实际为 {sched.shape}。")
     return sched
-
 
 @st.cache_data(show_spinner=False)
 def load_schedule_from_excel(content: bytes, filename: str = "upload.xlsx") -> Tuple[np.ndarray, int]:
-    """从上传内容解析排班矩阵和借调人数。自动适配 xlsx/xls/csv/xlsb。
-    返回 (schedule_matrix, borrow_count)。"""
-    from pathlib import Path
-    suffix = Path(filename).suffix.lower()
+    """
+    稳健读取 res_doctor.xlsx：
+      - 确认为真正的 .xlsx（zip 头 PK\x03\x04）
+      - 用 openpyxl 读取工作表（比 pandas 更宽容）
+      - 转成 DataFrame 后切 18×168
+      - 统计借调人数
+    """
+    from openpyxl import load_workbook
+
     bio = io.BytesIO(content)
 
-    df = None
+    # 1) 必须是真 .xlsx（zip 容器）
+    head = bio.read(4)
+    bio.seek(0)
+    if head != b"PK\x03\x04":
+        raise ValueError(
+            f"文件 {filename} 不是标准 .xlsx（zip）格式；"
+            "请用 Excel 打开后【另存为 → Excel 工作簿(.xlsx)】再上传。"
+        )
+
+    # 2) 用 openpyxl 读取
     try:
-        if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-            xl = pd.ExcelFile(bio, engine="openpyxl")
-            if not xl.sheet_names:
-                raise ValueError("上传文件未检测到工作表（xlsx/xlsm）。请确认不是空白或受保护文件。")
-            df = pd.read_excel(xl, sheet_name=0, header=None)
-        elif suffix == ".xls":
-            xl = pd.ExcelFile(bio, engine="xlrd")
-            if not xl.sheet_names:
-                raise ValueError("上传的 .xls 文件未检测到工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None, engine="xlrd")
-        elif suffix == ".xlsb":
-            xl = pd.ExcelFile(bio, engine="pyxlsb")
-            if not xl.sheet_names:
-                raise ValueError("上传的 .xlsb 文件未检测到工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None, engine="pyxlsb")
-        elif suffix == ".csv":
-            bio.seek(0)
-            df = pd.read_csv(bio, header=None)
-        else:
-            bio.seek(0)
-            xl = pd.ExcelFile(bio)
-            if not xl.sheet_names:
-                raise ValueError("上传文件未检测到任何工作表。")
-            df = pd.read_excel(xl, sheet_name=0, header=None)
+        wb = load_workbook(bio, data_only=True, read_only=True)
     except Exception as e:
-        raise ValueError(f"无法读取排班文件：{e}")
+        raise ValueError(f"openpyxl 无法打开 {filename}：{e}")
 
-    borrow = _borrow_count_like_user(df)
+    sheet_names = wb.sheetnames or []
+    if not sheet_names:
+        raise ValueError(f"{filename} 未检测到任何工作表（可能为空白/受保护）。")
+
+    ws = wb[sheet_names[0]]
+    values = [[cell.value for cell in row] for row in ws.iter_rows()]
+    df = pd.DataFrame(values)
+
+    # 3) 切排班矩阵 + 借调人数
     sched = _schedule_matrix_from_df(df)
+    borrow = _compute_borrow_count(df)
     return sched, borrow
-
 
 @st.cache_data(show_spinner=False)
-def load_optimized_schedule(path: str = OPTIMIZED_SCHEDULE_PATH) -> Tuple[np.ndarray, int]:
+def load_optimized_schedule(path: Path = OPTIMIZED_SCHEDULE_PATH) -> Tuple[np.ndarray, int]:
     df = pd.read_excel(path, sheet_name=0, header=None)
-    borrow = _borrow_count_like_user(df)
     sched = _schedule_matrix_from_df(df)
+    borrow = _compute_borrow_count(df)
     return sched, borrow
 
-
 # -------------------------
-# 仿真核心（与用户给定代码一致的逻辑，做了函数化和小修正）
+# 仿真核心
 # -------------------------
 class Simulator:
-    def __init__(self,
-                 arrival_rates: np.ndarray,  # (7,24)
-                 service_rate_per_doctor: float = 6.0,
-                 n_simulations: int = 1000,
-                 seed_base: int = 0):
+    def __init__(self, arrival_rates: np.ndarray, service_rate_per_doctor: float = 6.0,
+                 n_simulations: int = 1000, seed_base: int = 0):
         self.arrival_rates = arrival_rates
         self.service_rate_per_doctor = float(service_rate_per_doctor)
         self.n_simulations = int(n_simulations)
@@ -138,16 +129,11 @@ class Simulator:
         n_doctors, n_hours = doctor_schedule.shape
         T_end = float(n_hours)
 
-        # 计算总到达、总服务能力（用于 sanity check 文案）
-        total_arrivals = float(self.arrival_rates.sum())  # 7*24 小时总到达率之和（人）
-        # 每小时能力 = 在班医生数 * μ；总能力 = Σ 小时能力
-        hourly_doctors = doctor_schedule.sum(axis=0)  # (168,)
+        total_arrivals = float(self.arrival_rates.sum())
+        hourly_doctors = doctor_schedule.sum(axis=0)                 # (168,)
         total_capacity = float(np.dot(hourly_doctors, np.full(n_hours, self.service_rate_per_doctor)))
 
-        # 事件优先级
-        EVENT_ARRIVAL = 0
-        EVENT_CHECK   = 1
-        EVENT_FINISH  = 2
+        EVENT_ARRIVAL, EVENT_CHECK, EVENT_FINISH = 0, 1, 2
 
         def on_shift(d, t):
             idx = int(t)
@@ -162,7 +148,7 @@ class Simulator:
             doctor_busy_until = np.zeros(n_doctors, dtype=float)
             events = []
 
-            # 到达事件生成（piecewise-constant NHPP）
+            # 生成到达
             for hour in range(n_hours):
                 day = hour // 24
                 hr_in_day = hour % 24
@@ -179,18 +165,18 @@ class Simulator:
                     service_time = np.random.exponential(1.0 / self.service_rate_per_doctor)
                     heapq.heappush(events, (arrival_time, EVENT_ARRIVAL, "arrival", None, (arrival_time, service_time)))
 
-            # 整点换班检查
+            # 整点检查
             for hour in range(n_hours):
                 heapq.heappush(events, (float(hour), EVENT_CHECK, "check_shift", None, None))
 
             while events:
                 current_time, _, event_type, doctor_id, payload = heapq.heappop(events)
+
                 if event_type == "arrival":
                     arrival_time, service_time = payload
                     waiting_queue.append((arrival_time, service_time))
                     for d in range(n_doctors):
-                        if not waiting_queue:
-                            break
+                        if not waiting_queue: break
                         if on_shift(d, current_time) and doctor_busy_until[d] <= current_time:
                             start_time = max(current_time, doctor_busy_until[d])
                             if on_shift(d, start_time):
@@ -202,9 +188,7 @@ class Simulator:
 
                 elif event_type == "finish":
                     d = doctor_id
-                    if d is None:
-                        continue
-                    if on_shift(d, current_time) and waiting_queue:
+                    if d is not None and on_shift(d, current_time) and waiting_queue:
                         start_time = max(current_time, doctor_busy_until[d])
                         if on_shift(d, start_time):
                             pat_arrival, pat_service = waiting_queue.popleft()
@@ -215,8 +199,7 @@ class Simulator:
 
                 elif event_type == "check_shift":
                     for d in range(n_doctors):
-                        if not waiting_queue:
-                            break
+                        if not waiting_queue: break
                         if on_shift(d, current_time) and doctor_busy_until[d] <= current_time:
                             start_time = max(current_time, doctor_busy_until[d])
                             if on_shift(d, start_time):
@@ -226,7 +209,7 @@ class Simulator:
                                 total_wait_time += (start_time - pat_arrival)
                                 heapq.heappush(events, (finish_time, EVENT_FINISH, "finish", d, None))
 
-            # 口径A：只统计周内等待（末尾未开诊者等到 T_end）
+            # 口径A：只统计周内等待
             total_wait_time += sum(max(0.0, T_end - arr) for (arr, _) in waiting_queue)
             return total_wait_time
 
@@ -235,17 +218,13 @@ class Simulator:
         for i in range(self.n_simulations):
             all_total_wait[i] = simulate_once(seed=self.seed_base + i)
 
-        # 成本
         total_doctor_hours = float(doctor_schedule.sum())
         avg_total_wait = float(all_total_wait.mean())
         std_total_wait = float(all_total_wait.std(ddof=1)) if self.n_simulations > 1 else 0.0
 
-        # 文案提示（供显示）
-        supply_demand_note = (
-            "⚠️ 供给 < 需求：周末会积压，口径A的尾巴等待会较大。"
-            if total_capacity < total_arrivals else
-            "✅ 供给 ≥ 需求：尾巴不应过大；若等待仍陡增，需排查事件逻辑或数据切片。"
-        )
+        note = ("⚠️ 供给 < 需求：周末会积压，口径A尾巴等待较大。"
+                if total_capacity < total_arrivals else
+                "✅ 供给 ≥ 需求：尾巴不应过大；若等待仍陡增，请排查数据/事件逻辑。")
 
         return {
             "avg_total_wait": avg_total_wait,
@@ -253,34 +232,28 @@ class Simulator:
             "total_doctor_hours": total_doctor_hours,
             "borrow_doctor_count": borrow_doctor_count,
             "total_cost": avg_total_wait + total_doctor_hours * 1.3 + borrow_doctor_count * 20.0,
-            "note": supply_demand_note
+            "note": note
         }
-
 
 # -------------------------
 # 侧边栏参数
 # -------------------------
 st.sidebar.header("参数设置")
-mu = st.sidebar.number_input("单医生服务率 μ (人/小时)", min_value=0.1, max_value=60.0, value=6.0, step=0.1)
+mu    = st.sidebar.number_input("单医生服务率 μ (人/小时)", min_value=0.1, max_value=60.0, value=6.0, step=0.1)
 nruns = st.sidebar.number_input("仿真次数", min_value=1, max_value=5000, value=1000, step=100)
 seed0 = st.sidebar.number_input("随机种子基数", min_value=0, max_value=10_000_000, value=0, step=1)
 
-# （按用户要求）去掉自定义到达率上传接口；一律使用仓库内默认到达文件
-
 # 必传：res_doctor.xlsx
 st.subheader("上传来访者排班表（res_doctor.xlsx）")
-upload = st.file_uploader("选择 Excel 文件", type=["xlsx", "xls"], accept_multiple_files=False)
+upload = st.file_uploader("选择 Excel 文件（必须为 .xlsx 工作簿）", type=["xlsx"], accept_multiple_files=False)
 
 col_run, col_info = st.columns([1, 1])
-
 with col_info:
     st.markdown("""
 **文件格式要求**
-- **res_doctor.xlsx**：
-  - 第 2~19 行 × 第 2~169 列为 0/1 排班矩阵（18 × 168）。
-  - 第 13 行及以后用于统计“借调医生数”（任一工时>0 计 1 人）。
-- **到达文件**：固定从仓库内 `2025 服务系统问题-问题数据.xlsx` 读取（工作表名“数据”，第 6~12 行 × 第 2~25 列为到达率 7×24）。
-- **优化方案**：固定从仓库内 `optimized_schedule_IDs_01_matrix.xlsx` 读取相同格式矩阵。
+- **res_doctor.xlsx**：第 2~19 行 × 第 2~169 列为 0/1 排班矩阵（18 × 168）；第 13 行及以后用于“借调人数”（任一工时>0 计 1 人）。
+- **到达文件**：固定从 `2025 服务系统问题-问题数据.xlsx` 读取（工作表“数据”，第 6~12 行 × 第 2~25 列 → 7×24）。
+- **优化方案**：固定从 `optimized_schedule_IDs_01_matrix.xlsx` 读取，同格式矩阵。
 """)
 
 # -------------------------
@@ -295,14 +268,16 @@ if upload is not None:
 
         # 来访者排班
         if upload.size == 0:
-            raise ValueError("上传的排班文件为空（0 字节）。请检查导出方式并重试。")
+            raise ValueError("上传的排班文件为空（0 字节）。")
         sched_user, borrow_user = load_schedule_from_excel(upload.getvalue(), filename=upload.name)
+
         # 内置优化排班
+        if not OPTIMIZED_SCHEDULE_PATH.exists():
+            raise FileNotFoundError(f"未找到优化方案文件：{OPTIMIZED_SCHEDULE_PATH}")
         sched_opt, borrow_opt = load_optimized_schedule(OPTIMIZED_SCHEDULE_PATH)
 
         # 运行仿真
         sim = Simulator(arrival_rates, service_rate_per_doctor=mu, n_simulations=nruns, seed_base=seed0)
-
         with st.spinner("正在运行来访者排班仿真……"):
             res_user = sim.run_for_schedule(sched_user, borrow_user)
         with st.spinner("正在运行优化排班仿真……"):
@@ -322,7 +297,6 @@ if upload is not None:
                 f"总成本: {res['total_cost']:.2f}",
                 language="text"
             )
-
         _pretty_block(c1, "来访者上传排班", res_user)
         _pretty_block(c2, "内置优化排班", res_opt)
 
@@ -350,18 +324,16 @@ if upload is not None:
             },
         ])
         st.dataframe(out_df, use_container_width=True)
-
         csv = out_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("下载结果 CSV", data=csv, file_name="simulation_results.csv", mime="text/csv")
 
     except Exception as e:
-        # 显示更详细的错误上下文，帮助定位是哪一个文件导致
         st.error("出错了：" + str(e))
         st.info(
-            f"调试信息："
-            f"- 上传文件名：{upload.name if upload else '（未上传）'}"
-            f"- 固定到达率路径：{ARRIVAL_DEFAULT_PATH}"
+            "调试信息：\n"
+            f"- 上传文件名：{upload.name if upload else '（未上传）'}\n"
+            f"- 固定到达率路径：{ARRIVAL_DEFAULT_PATH}\n"
             f"- 固定优化方案路径：{OPTIMIZED_SCHEDULE_PATH}"
         )
 else:
-    st.info("请上传 res_doctor.xlsx（支持 .xlsx/.xls）。")
+    st.info("请上传 res_doctor.xlsx（必须为 .xlsx 工作簿）。")
