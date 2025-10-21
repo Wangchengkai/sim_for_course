@@ -21,6 +21,7 @@
 """
 
 import io
+import time
 import heapq
 from collections import deque
 from typing import Tuple, Optional
@@ -28,6 +29,7 @@ from typing import Tuple, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 
 # -------------------------
 # 页面设置
@@ -37,10 +39,11 @@ st.title("⚕️ 急诊排班仿真评估（事件驱动 · 周内等待口径A�
 st.caption("上传排班表，快速得到等待与成本指标；并与内置优化排班进行对比。")
 
 # -------------------------
-# 读取/解析工具
+# 读取/解析工具（用脚本所在目录作为基准，避免工作目录不同导致找不到文件）
 # -------------------------
-ARRIVAL_DEFAULT_PATH = "2025 服务系统问题-问题数据.xlsx"
-OPTIMIZED_SCHEDULE_PATH = "optimized_schedule_IDs_01_matrix.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+ARRIVAL_DEFAULT_PATH = BASE_DIR / "2025 服务系统问题-问题数据.xlsx"
+OPTIMIZED_SCHEDULE_PATH = BASE_DIR / "optimized_schedule_IDs_01_matrix.xlsx"
 
 @st.cache_data(show_spinner=False)
 def load_arrival_rates_from_excel(path: str, sheet_name: str = "数据") -> np.ndarray:
@@ -87,7 +90,7 @@ def load_optimized_schedule(path: str = OPTIMIZED_SCHEDULE_PATH) -> Tuple[np.nda
 
 
 # -------------------------
-# 仿真核心
+# 仿真核心（与用户给定代码一致的逻辑，做了函数化和小修正）
 # -------------------------
 class Simulator:
     def __init__(self,
@@ -257,7 +260,9 @@ if upload is not None:
     try:
         # 到达率
         if arrival_up is not None:
-            df_tmp = pd.read_excel(arrival_up, sheet_name="数据", header=None)
+            arrival_rates = load_arrival_rates_from_excel(path=None, sheet_name="数据")  # 占位以走 cache 策略
+            # 直接从上传读取（不缓存）
+            df_tmp = pd.read_excel(uploaded_file:=arrival_up, sheet_name="数据", header=None)
             arrival_rates = df_tmp.iloc[5:12, 1:25].values.astype(float)
         else:
             arrival_rates = load_arrival_rates_from_excel(ARRIVAL_DEFAULT_PATH)
